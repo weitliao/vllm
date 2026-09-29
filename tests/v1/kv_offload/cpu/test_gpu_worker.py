@@ -698,3 +698,66 @@ def test_load_waits_for_pending_compute_stream_writes(default_vllm_config) -> No
                 torch.testing.assert_close(gpu_tensor[block_id].cpu(), expected)
     finally:
         worker.shutdown()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="stream ordering test requires a CUDA-like platform",
+)
+@torch.inference_mode()
+def test_load_orders_later_compute_after_the_copy(default_vllm_config) -> None:
+    """A load holds later compute until the copy finishes; a store does not."""
+    device = DEVICES[0]
+    page_size_bytes = 128 * 1024
+    num_blocks = 2048  # 256 MiB, long enough that the copy is still in flight
+    block_ids = list(range(num_blocks))
+    sentinel = 0x5A
+    fill_value = 0x22
+
+    gpu_tensor = torch.zeros(
+        (num_blocks, page_size_bytes), dtype=torch.int8, device=device
+    )
+    worker = CPUOffloadingWorker(
+        kv_caches=CanonicalKVCaches(
+            tensors=[
+                CanonicalKVCacheTensor(
+                    tensor=gpu_tensor, page_size_bytes=page_size_bytes
+                )
+            ],
+            group_data_refs=[
+                [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_size_bytes)]
+            ],
+        ),
+        blocks_per_chunk=1,
+        num_cpu_chunks=num_blocks,
+    )
+    worker._load_handler.src_tensors[0].fill_(sentinel)
+    gpu_spec = GPULoadStoreSpec(
+        block_ids,
+        group_sizes=(len(block_ids),),
+        block_indices=(0,),
+    )
+    cpu_spec = CPULoadStoreSpec(block_ids)
+
+    try:
+        torch.accelerator.synchronize()
+        assert worker.submit_load(1, cpu_spec, gpu_spec)
+        gpu_tensor[0].fill_(fill_value)
+        torch.cuda.current_stream().synchronize()
+
+        load_end = worker._load_handler._transfers[0].end_event
+        assert load_end.query(), "compute finished before the load copy"
+        assert int(gpu_tensor[0, 0].item()) == fill_value
+        assert int(gpu_tensor[1, 0].item()) == sentinel
+
+        torch.accelerator.synchronize()
+        while worker.get_finished():
+            pass
+        gpu_tensor.fill_(0x11)
+        torch.accelerator.synchronize()
+        assert worker.submit_store(2, gpu_spec, cpu_spec)
+        torch.cuda.current_stream().synchronize()
+        store_end = worker._store_handler._transfers[-1].end_event
+        assert not store_end.query(), "store copy blocked the compute stream"
+    finally:
+        worker.shutdown()

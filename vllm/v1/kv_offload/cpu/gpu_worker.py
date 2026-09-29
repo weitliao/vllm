@@ -717,6 +717,13 @@ class SingleDirectionOffloadingHandler:
                 )
             end_event.record(stream)
 
+        # A host-to-device load must finish before later compute. The copy
+        # stream already waited for work queued before this call, so this
+        # wait orders only work queued afterward and does not cycle. Stores
+        # stay overlapped with the next forward.
+        if not self.gpu_to_cpu:
+            current_platform.current_stream().wait_event(end_event)
+
         self._transfer_events[job_id] = end_event
         self._transfers.append(
             Transfer(
